@@ -1,4 +1,4 @@
-name: Sync north-4 sglang and vllm-ascend Images
+name: Sync north-4 sglang and vllm-ascend Images for mindie
 
 on:
   workflow_dispatch:
