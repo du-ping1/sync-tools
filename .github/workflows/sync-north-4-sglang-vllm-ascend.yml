@@ -1,0 +1,110 @@
+name: Sync north-4 sglang and vllm-ascend Images
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"
+
+concurrency:
+  group: sync-north-4-sglang-vllm-ascend
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync ${{ matrix.src }}
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/skopeo/stable:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - src: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang
+            dest: swr.cn-north-4.myhuaweicloud.com/images_sync/sglang
+          - src: quay.io/ascend/vllm-ascend
+            dest: swr.cn-north-4.myhuaweicloud.com/images_sync/vllm-ascend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq and curl
+        run: microdnf install -y jq curl
+
+      - name: Sync ${{ matrix.src }} → ${{ matrix.dest }}
+        env:
+          SWR_NORTH4_USER: ${{ vars.SWR_NORTH4_USER }}
+          SWR_NORTH4_SECRET: ${{ secrets.SWR_NORTH4_SECRET }}
+          CURRENT_SRC: ${{ matrix.src }}
+          CURRENT_DEST: ${{ matrix.dest }}
+        run: |
+          set -e
+
+          # 源仓库公开，匿名拉取；目标 north-4 需要认证上传
+          SRC_INSPECT_ARGS=(--no-creds)
+          SRC_COPY_ARGS=(--src-no-creds)
+          DEST_INSPECT_ARGS=(--creds "${SWR_NORTH4_USER}:${SWR_NORTH4_SECRET}")
+          DEST_COPY_ARGS=(--dest-creds "${SWR_NORTH4_USER}:${SWR_NORTH4_SECRET}")
+
+          # 比较各平台子 manifest digest 列表（content-addressed，跨 registry 稳定）
+          get_manifest_id() {
+            local raw
+            raw=$(skopeo inspect --raw "$@" 2>/dev/null || true)
+            [ -z "$raw" ] && echo "" && return
+            echo "$raw" | jq -r '
+              if .manifests then
+                [.manifests[].digest] | sort | join(",")
+              else
+                .config.digest // empty
+              end
+            ' 2>/dev/null || true
+          }
+
+          SRC="$CURRENT_SRC"
+          DEST="$CURRENT_DEST"
+
+          TAGS=$(skopeo list-tags "${SRC_INSPECT_ARGS[@]}" docker://"$SRC" 2>/dev/null | jq -r '.Tags[]')
+          if [ -z "$TAGS" ]; then
+            echo "No tags found for $SRC"
+            exit 0
+          fi
+
+          TAG_COUNT=$(echo "$TAGS" | wc -l)
+          echo "Found $TAG_COUNT tags for $SRC"
+          echo "--- $SRC → $DEST ---"
+
+          SYNCED=0; SKIPPED=0; FAILED=0
+
+          for tag in $TAGS; do
+            SRC_IMG="docker://$SRC:$tag"
+            DEST_IMG="docker://$DEST:$tag"
+            echo "from=\"$SRC_IMG\" to=\"$DEST_IMG\""
+
+            SRC_DIGEST=$(get_manifest_id "${SRC_INSPECT_ARGS[@]}" "$SRC_IMG")
+            DEST_DIGEST=$(get_manifest_id "${DEST_INSPECT_ARGS[@]}" "$DEST_IMG")
+            if [ -n "$SRC_DIGEST" ] && [ -n "$DEST_DIGEST" ] && [ "$SRC_DIGEST" = "$DEST_DIGEST" ]; then
+              echo "⏭️  Skip $tag"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            echo "Syncing $tag..."
+            set +e
+            skopeo copy --all \
+              --retry-times 3 \
+              --retry-delay 5s \
+              "${SRC_COPY_ARGS[@]}" \
+              "${DEST_COPY_ARGS[@]}" \
+              "$SRC_IMG" "$DEST_IMG"
+            copy_exit=$?
+            set -e
+            if [ $copy_exit -eq 0 ] || [ $copy_exit -eq 2 ]; then
+              echo "✅ Synced $tag"
+              SYNCED=$((SYNCED + 1))
+            else
+              echo "❌ Failed $tag (exit $copy_exit)"
+              FAILED=$((FAILED + 1))
+            fi
+          done
+
+          echo "Done [$SRC → $DEST]: $SYNCED synced, $SKIPPED skipped, $FAILED failed"
+          [ $FAILED -eq 0 ] || exit 1
